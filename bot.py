@@ -5,15 +5,15 @@ import html
 import logging
 import shutil
 import tempfile
+import sys
 from urllib.parse import urlparse, quote, unquote
+from pathlib import Path
+import mimetypes
+import subprocess
 
 from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
-
-import subprocess
-from pathlib import Path
-import mimetypes
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -26,10 +26,11 @@ logging.basicConfig(
 logger = logging.getLogger("pinterest_bot")
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+PIN_ID_RE = re.compile(r"/pin/(\d+)")
+MP4_RE = re.compile(r"https://v\.pinimg\.com/[^\s\"'<>]+\.mp4[^\s\"'<>]*", re.IGNORECASE)
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-PIN_ID_RE = re.compile(r"/pin/(\d+)")
 
 def is_pinterest_url(u: str) -> bool:
     try:
@@ -47,25 +48,6 @@ def normalize_pin_url(url: str) -> str:
     if m:
         return f"https://www.pinterest.com/pin/{m.group(1)}/"
     return url
-
-def ytdlp_download(url: str, timeout: int = 120) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="pinsaver_")
-    outtmpl = str(Path(tmpdir) / "media.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "-f", "bv*+ba/best",
-        "-o", outtmpl,
-        url,
-    ]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout or "yt-dlp failed")[:2000])
-    files = sorted(Path(tmpdir).glob("media.*"), key=lambda x: x.stat().st_size, reverse=True)
-    if not files:
-        raise RuntimeError("yt-dlp produced no files")
-    return str(files[0])
 
 def pinterest_oembed(pin_url: str, timeout: int = 20) -> dict | None:
     endpoint = "https://www.pinterest.com/oembed.json?url=" + quote(pin_url, safe="")
@@ -92,27 +74,15 @@ def scrape_og(pin_url: str, timeout: int = 20) -> dict:
             out[prop] = html.unescape(tag["content"])
     return out
 
-def pick_media(resolved_pin_url: str) -> tuple[str | None, str]:
+def extract_best_media(resolved_pin_url: str) -> tuple[str | None, str | None]:
     data = pinterest_oembed(resolved_pin_url)
+    thumb = None
     if data:
         thumb = data.get("thumbnail_url")
-        if thumb:
-            return thumb, "photo"
     og = scrape_og(resolved_pin_url)
     v = og.get("og:video") or og.get("og:video:url")
-    img = og.get("og:image")
-    og_type = (og.get("og:type") or "").lower()
-    if v:
-        kind = "video"
-        if "gif" in og_type:
-            kind = "gif"
-        return v, kind
-    if img:
-        kind = "photo"
-        if "gif" in og_type or img.lower().endswith(".gif"):
-            kind = "gif"
-        return img, kind
-    return None, "none"
+    img = og.get("og:image") or thumb
+    return img, v
 
 def sniff_extension(url: str, content_type: str | None) -> str:
     path = unquote(urlparse(url).path or "").lower()
@@ -133,7 +103,7 @@ def sniff_extension(url: str, content_type: str | None) -> str:
             return ".jpg"
     return ".bin"
 
-def download_to_temp(url: str, timeout: int = 40, max_bytes: int = 100 * 1024 * 1024) -> tuple[str, str, str | None]:
+def download_to_temp(url: str, timeout: int = 60, max_bytes: int = 100 * 1024 * 1024) -> tuple[str, str, str | None]:
     with SESSION.get(url, stream=True, timeout=timeout, allow_redirects=True) as r:
         r.raise_for_status()
         content_type = r.headers.get("Content-Type")
@@ -151,46 +121,118 @@ def download_to_temp(url: str, timeout: int = 40, max_bytes: int = 100 * 1024 * 
                 f.write(chunk)
     return path, ext, content_type
 
+def find_pinimg_mp4(pin_url: str, timeout: int = 20) -> str | None:
+    r = SESSION.get(pin_url, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    text = r.text
+    m = MP4_RE.search(text)
+    if m:
+        return m.group(0)
+    candidates = MP4_RE.findall(text)
+    if candidates:
+        return candidates[0]
+    return None
+
+def ytdlp_try_download(url: str, timeout: int = 120) -> str | None:
+    tmpdir = tempfile.mkdtemp(prefix="pinsaver_")
+    outtmpl = str(Path(tmpdir) / "media.%(ext)s")
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-f", "bv*+ba/best/best",
+        "-o", outtmpl,
+        url,
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "")
+        if "No video formats found" in err:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError(err[:2000])
+    files = sorted(Path(tmpdir).glob("media.*"), key=lambda x: x.stat().st_size, reverse=True)
+    if not files:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return None
+    return str(files[0])
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.text:
         return
 
-    text = msg.text
-    urls = [m.group(1) for m in URL_RE.finditer(text)]
+    urls = [m.group(1) for m in URL_RE.finditer(msg.text)]
     pin_urls = [u for u in urls if is_pinterest_url(u)]
     if not pin_urls:
         return
 
-    for raw in pin_urls:
+    for raw_url in pin_urls:
         tmp_path = None
+        tmp_dir = None
         try:
-            resolved = await asyncio.to_thread(resolve_url, raw)
-            local_path = await asyncio.to_thread(ytdlp_download, resolved)
+            resolved = await asyncio.to_thread(resolve_url, raw_url)
+            resolved = normalize_pin_url(resolved)
 
-            ext = Path(local_path).suffix.lower()
-            mime, _ = mimetypes.guess_type(local_path)
+            mp4_url = await asyncio.to_thread(find_pinimg_mp4, resolved)
+            if mp4_url:
+                tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, mp4_url)
+                with open(tmp_path, "rb") as f:
+                    await msg.reply_video(video=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                continue
 
-            if ext in [".mp4", ".webm", ".mov", ".mkv"]:
-                with open(local_path, "rb") as f:
-                    await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
-            elif ext == ".gif" or (mime == "image/gif"):
-                with open(local_path, "rb") as f:
-                    await msg.reply_animation(animation=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+            local_path = await asyncio.to_thread(ytdlp_try_download, resolved)
+            if local_path:
+                tmp_dir = str(Path(local_path).parent)
+                ext = Path(local_path).suffix.lower()
+                mime, _ = mimetypes.guess_type(local_path)
+
+                if ext in [".mp4", ".webm", ".mov", ".mkv"]:
+                    with open(local_path, "rb") as f:
+                        await msg.reply_video(video=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                elif ext == ".gif" or mime == "image/gif":
+                    with open(local_path, "rb") as f:
+                        await msg.reply_animation(animation=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                else:
+                    with open(local_path, "rb") as f:
+                        await msg.reply_document(document=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                continue
+
+            photo_url, video_url = await asyncio.to_thread(extract_best_media, resolved)
+            if video_url:
+                tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, video_url)
+                with open(tmp_path, "rb") as f:
+                    await msg.reply_video(video=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+            elif photo_url:
+                tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, photo_url)
+                if ext == ".gif":
+                    with open(tmp_path, "rb") as f:
+                        await msg.reply_animation(animation=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                else:
+                    with open(tmp_path, "rb") as f:
+                        await msg.reply_photo(photo=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
             else:
-                with open(local_path, "rb") as f:
-                    await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
-
-
+                await msg.reply_text("Could not extract media from that pin.")
         except Exception as e:
             logger.exception("failed")
             await msg.reply_text(f"Error: {e}")
         finally:
-            try:
-                if local_path and os.path.exists(local_path):
-                    shutil.rmtree(str(Path(local_path).parent), ignore_errors=True)
-            except Exception:
-                pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            if tmp_dir and os.path.exists(tmp_dir):
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("error update=%s", update, exc_info=context.error)
