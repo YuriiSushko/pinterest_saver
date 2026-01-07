@@ -3,14 +3,21 @@ import re
 import asyncio
 import html
 import logging
-from urllib.parse import urlparse, quote
-from dotenv import load_dotenv
+import shutil
+import tempfile
+from urllib.parse import urlparse, quote, unquote
 
+from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
 
+import subprocess
+from pathlib import Path
+import mimetypes
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -20,6 +27,10 @@ logger = logging.getLogger("pinterest_bot")
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+PIN_ID_RE = re.compile(r"/pin/(\d+)")
+
 def is_pinterest_url(u: str) -> bool:
     try:
         host = urlparse(u).netloc.lower()
@@ -27,166 +38,178 @@ def is_pinterest_url(u: str) -> bool:
         return False
     return host == "pin.it" or "pinterest." in host
 
-def resolve_url(url: str, timeout: int = 15) -> str:
-    logger.debug("resolve_url start url=%s timeout=%s", url, timeout)
-    r = requests.get(
-        url,
-        allow_redirects=True,
-        timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    logger.debug(
-        "resolve_url done status=%s final_url=%s history_len=%s",
-        r.status_code,
-        r.url,
-        len(r.history),
-    )
+def resolve_url(url: str, timeout: int = 20) -> str:
+    r = SESSION.get(url, allow_redirects=True, timeout=timeout)
     return r.url
 
-def pinterest_oembed(pin_url: str, timeout: int = 15) -> dict | None:
+def normalize_pin_url(url: str) -> str:
+    m = PIN_ID_RE.search(url)
+    if m:
+        return f"https://www.pinterest.com/pin/{m.group(1)}/"
+    return url
+
+def ytdlp_download(url: str, timeout: int = 120) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="pinsaver_")
+    outtmpl = str(Path(tmpdir) / "media.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-f", "bv*+ba/best",
+        "-o", outtmpl,
+        url,
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout or "yt-dlp failed")[:2000])
+    files = sorted(Path(tmpdir).glob("media.*"), key=lambda x: x.stat().st_size, reverse=True)
+    if not files:
+        raise RuntimeError("yt-dlp produced no files")
+    return str(files[0])
+
+def pinterest_oembed(pin_url: str, timeout: int = 20) -> dict | None:
     endpoint = "https://www.pinterest.com/oembed.json?url=" + quote(pin_url, safe="")
-    logger.debug("oembed start pin_url=%s endpoint=%s", pin_url, endpoint)
-    r = requests.get(endpoint, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    logger.debug("oembed http status=%s", r.status_code)
+    r = SESSION.get(endpoint, timeout=timeout)
     if r.status_code != 200:
-        try:
-            logger.debug("oembed non-200 body=%s", r.text[:2000])
-        except Exception:
-            pass
         return None
     try:
         data = r.json()
     except Exception:
-        logger.exception("oembed json parse failed")
         return None
     if "error" in data:
-        logger.debug("oembed returned error=%s", data.get("error"))
         return None
-    logger.debug(
-        "oembed ok keys=%s provider=%s type=%s",
-        list(data.keys()),
-        data.get("provider_name"),
-        data.get("type"),
-    )
     return data
 
-def scrape_og_media(pin_url: str, timeout: int = 15) -> tuple[str | None, str | None]:
-    logger.debug("scrape_og start url=%s", pin_url)
-    r = requests.get(pin_url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    logger.debug("scrape_og http status=%s len=%s", r.status_code, len(r.text or ""))
+def scrape_og(pin_url: str, timeout: int = 20) -> dict:
+    r = SESSION.get(pin_url, timeout=timeout)
     if r.status_code != 200:
-        return None, None
+        return {}
     soup = BeautifulSoup(r.text, "html.parser")
-
-    def meta(prop: str) -> str | None:
+    out = {}
+    for prop in ["og:image", "og:video", "og:video:url", "og:type"]:
         tag = soup.find("meta", attrs={"property": prop})
         if tag and tag.get("content"):
-            return html.unescape(tag["content"])
-        return None
+            out[prop] = html.unescape(tag["content"])
+    return out
 
-    img = meta("og:image")
-    vid = meta("og:video") or meta("og:video:url")
-    logger.debug("scrape_og found og:image=%s og:video=%s", img, vid)
-    return img, vid
-
-def extract_best_media(pin_url: str) -> tuple[str | None, str | None]:
-    logger.debug("extract_best_media start url=%s", pin_url)
-    data = pinterest_oembed(pin_url)
+def pick_media(resolved_pin_url: str) -> tuple[str | None, str]:
+    data = pinterest_oembed(resolved_pin_url)
     if data:
         thumb = data.get("thumbnail_url")
-        embed_html = data.get("html", "")
-        best_img = None
+        if thumb:
+            return thumb, "photo"
+    og = scrape_og(resolved_pin_url)
+    v = og.get("og:video") or og.get("og:video:url")
+    img = og.get("og:image")
+    og_type = (og.get("og:type") or "").lower()
+    if v:
+        kind = "video"
+        if "gif" in og_type:
+            kind = "gif"
+        return v, kind
+    if img:
+        kind = "photo"
+        if "gif" in og_type or img.lower().endswith(".gif"):
+            kind = "gif"
+        return img, kind
+    return None, "none"
 
-        logger.debug(
-            "extract_best_media oembed thumb=%s embed_html_len=%s",
-            thumb,
-            len(embed_html or ""),
-        )
+def sniff_extension(url: str, content_type: str | None) -> str:
+    path = unquote(urlparse(url).path or "").lower()
+    for ext in [".mp4", ".mov", ".webm", ".gif", ".jpg", ".jpeg", ".png"]:
+        if path.endswith(ext):
+            return ext
+    if content_type:
+        ct = content_type.lower()
+        if "video/mp4" in ct:
+            return ".mp4"
+        if "video/webm" in ct:
+            return ".webm"
+        if "image/gif" in ct:
+            return ".gif"
+        if "image/png" in ct:
+            return ".png"
+        if "image/jpeg" in ct:
+            return ".jpg"
+    return ".bin"
 
-        if embed_html:
-            soup = BeautifulSoup(embed_html, "html.parser")
-            img = soup.find("img")
-            if img and img.get("src"):
-                best_img = img["src"]
-
-        if not best_img:
-            best_img = thumb
-
-        og_img, og_vid = scrape_og_media(pin_url)
-        photo = og_img or best_img
-        video = og_vid
-        logger.debug("extract_best_media result photo=%s video=%s", photo, video)
-        return photo, video
-
-    photo, video = scrape_og_media(pin_url)
-    logger.debug("extract_best_media fallback result photo=%s video=%s", photo, video)
-    return photo, video
+def download_to_temp(url: str, timeout: int = 40, max_bytes: int = 100 * 1024 * 1024) -> tuple[str, str, str | None]:
+    with SESSION.get(url, stream=True, timeout=timeout, allow_redirects=True) as r:
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type")
+        ext = sniff_extension(url, content_type)
+        fd, path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        total = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("File too large")
+                f.write(chunk)
+    return path, ext, content_type
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.text:
-        logger.debug("on_text ignored no message/text update=%s", update)
         return
 
-    chat = msg.chat
-    user = msg.from_user
-
-    logger.info(
-        "message received chat_id=%s chat_type=%s chat_title=%s user_id=%s username=%s text=%r",
-        getattr(chat, "id", None),
-        getattr(chat, "type", None),
-        getattr(chat, "title", None),
-        getattr(user, "id", None),
-        getattr(user, "username", None),
-        msg.text,
-    )
-
-    urls = [m.group(1) for m in URL_RE.finditer(msg.text)]
+    text = msg.text
+    urls = [m.group(1) for m in URL_RE.finditer(text)]
     pin_urls = [u for u in urls if is_pinterest_url(u)]
-
-    logger.debug("extracted urls=%s pin_urls=%s", urls, pin_urls)
-
     if not pin_urls:
         return
 
-    for raw_url in pin_urls:
+    for raw in pin_urls:
+        tmp_path = None
         try:
-            logger.info("processing url=%s", raw_url)
-            resolved = await asyncio.to_thread(resolve_url, raw_url)
-            logger.info("resolved url=%s -> %s", raw_url, resolved)
+            resolved = await asyncio.to_thread(resolve_url, raw)
+            local_path = await asyncio.to_thread(ytdlp_download, resolved)
 
-            photo_url, video_url = await asyncio.to_thread(extract_best_media, resolved)
-            logger.info("media extracted photo=%s video=%s", photo_url, video_url)
+            ext = Path(local_path).suffix.lower()
+            mime, _ = mimetypes.guess_type(local_path)
 
-            if video_url:
-                logger.info("sending video")
-                await msg.reply_video(video=video_url)
-                logger.info("video sent")
-            elif photo_url:
-                logger.info("sending photo")
-                await msg.reply_photo(photo=photo_url)
-                logger.info("photo sent")
+            if ext in [".mp4", ".webm", ".mov", ".mkv"]:
+                with open(local_path, "rb") as f:
+                    await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+            elif ext == ".gif" or (mime == "image/gif"):
+                with open(local_path, "rb") as f:
+                    await msg.reply_animation(animation=f, read_timeout=120, write_timeout=120, connect_timeout=20)
             else:
-                logger.warning("no media extracted")
-                await msg.reply_text("Idi nahui")
-        except Exception:
-            logger.exception("failed processing url=%s", raw_url)
+                with open(local_path, "rb") as f:
+                    await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+
+
+        except Exception as e:
+            logger.exception("failed")
+            await msg.reply_text(f"Error: {e}")
+        finally:
             try:
-                await msg.reply_text("Error while saving that pin.")
+                if local_path and os.path.exists(local_path):
+                    shutil.rmtree(str(Path(local_path).parent), ignore_errors=True)
             except Exception:
-                logger.exception("failed sending error message")
+                pass
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("dispatcher error update=%s", update, exc_info=context.error)
+    logger.exception("error update=%s", update, exc_info=context.error)
 
 def main() -> None:
     load_dotenv()
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
+    token = os.getenv("BOT_TOKEN")
+    if not token:
         raise RuntimeError("BOT_TOKEN is missing")
 
-    logger.info("starting bot polling")
-    app = Application.builder().token(bot_token).build()
+    request = HTTPXRequest(
+        connection_pool_size=20,
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=20,
+        pool_timeout=20
+    )
+
+    app = Application.builder().token(token).request(request).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     app.run_polling()
