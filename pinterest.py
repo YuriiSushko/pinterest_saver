@@ -11,6 +11,39 @@ MP4_RE = re.compile(r"https://v\.pinimg\.com/[^\s\"'<>]+\.mp4[^\s\"'<>]*", re.IG
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+GIF_URL_RE = re.compile(r"https://i\.pinimg\.com/[^\s\"'<>]+\.gif[^\s\"'<>]*", re.IGNORECASE)
+GIF_HINT_RE = re.compile(r"(animated[_-]?gif|\"is_gif\"\s*:\s*true|\"isGif\"\s*:\s*true|\"content_type\"\s*:\s*\"animated_gif\"|\"pin_type\"\s*:\s*\"gif\")", re.IGNORECASE)
+VIDEO_HINT_RE = re.compile(r"(\"type\"\s*:\s*\"video\"|\"is_video\"\s*:\s*true|\"isVideo\"\s*:\s*true|\"content_type\"\s*:\s*\"video\")", re.IGNORECASE)
+
+def fetch_pin_html(pin_url: str, timeout: int = 20) -> str:
+    r = SESSION.get(pin_url, timeout=timeout)
+    if r.status_code != 200:
+        return ""
+    return r.text or ""
+
+def find_pinimg_gif_from_html(html_text: str) -> str | None:
+    m = GIF_URL_RE.search(html_text)
+    if m:
+        return m.group(0)
+    return None
+
+def find_pinimg_mp4_from_html(html_text: str) -> str | None:
+    m = MP4_RE.search(html_text)
+    if m:
+        return m.group(0)
+    candidates = MP4_RE.findall(html_text)
+    if candidates:
+        return candidates[0]
+    return None
+
+def classify_pin_from_html(html_text: str) -> str:
+    if not html_text:
+        return "unknown"
+    if GIF_HINT_RE.search(html_text):
+        return "gif"
+    if VIDEO_HINT_RE.search(html_text):
+        return "video"
+    return "unknown"
 
 def extract_urls(text: str) -> list[str]:
     return [m.group(1) for m in URL_RE.finditer(text or "")]
@@ -31,6 +64,16 @@ def normalize_pin_url(url: str) -> str:
     if m:
         return f"https://www.pinterest.com/pin/{m.group(1)}/"
     return url
+
+def find_pinimg_gif(pin_url: str, timeout: int = 20) -> str | None:
+    r = SESSION.get(pin_url, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    text = r.text
+    m = GIF_RE.search(text)
+    if m:
+        return m.group(0)
+    return None
 
 def pinterest_oembed(pin_url: str, timeout: int = 20) -> dict | None:
     endpoint = "https://www.pinterest.com/oembed.json?url=" + quote(pin_url, safe="")

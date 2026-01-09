@@ -9,8 +9,18 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.request import HTTPXRequest
 
-from pinterest import extract_urls, is_pinterest_url, resolve_url, normalize_pin_url, find_pinimg_mp4, extract_best_media
-from downloader import download_to_temp, ytdlp_try_download
+from pinterest import (
+    extract_urls,
+    is_pinterest_url,
+    resolve_url,
+    normalize_pin_url,
+    fetch_pin_html,
+    classify_pin_from_html,
+    find_pinimg_gif_from_html,
+    find_pinimg_mp4_from_html,
+    extract_best_media,
+)
+from downloader import download_to_temp, ytdlp_try_download, mp4_to_gif
 
 logger = logging.getLogger("pinterest_bot")
 
@@ -26,30 +36,52 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for raw_url in pin_urls:
         tmp_path = None
-        tmp_dir = None
+        tmp_dirs = []
         try:
             resolved = await asyncio.to_thread(resolve_url, raw_url)
             resolved = normalize_pin_url(resolved)
 
-            mp4_url = await asyncio.to_thread(find_pinimg_mp4, resolved)
+            html_text = await asyncio.to_thread(fetch_pin_html, resolved)
+            pin_kind = classify_pin_from_html(html_text)
+
+            gif_url = find_pinimg_gif_from_html(html_text)
+            if gif_url:
+                tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, gif_url)
+                with open(tmp_path, "rb") as f:
+                    await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                continue
+
+            mp4_url = find_pinimg_mp4_from_html(html_text)
             if mp4_url:
                 tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, mp4_url)
-                with open(tmp_path, "rb") as f:
-                    await msg.reply_video(video=f, caption="Saved from Pinterest", read_timeout=120, write_timeout=120, connect_timeout=20)
+                if pin_kind == "gif":
+                    gif_local = await asyncio.to_thread(mp4_to_gif, tmp_path)
+                    tmp_dirs.append(str(Path(gif_local).parent))
+                    with open(gif_local, "rb") as f:
+                        await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                else:
+                    with open(tmp_path, "rb") as f:
+                        await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
                 continue
 
             local_path = await asyncio.to_thread(ytdlp_try_download, resolved)
             if local_path:
-                tmp_dir = str(Path(local_path).parent)
+                tmp_dirs.append(str(Path(local_path).parent))
                 ext = Path(local_path).suffix.lower()
                 mime, _ = mimetypes.guess_type(local_path)
 
                 if ext in [".mp4", ".webm", ".mov", ".mkv"]:
-                    with open(local_path, "rb") as f:
-                        await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                    if pin_kind == "gif":
+                        gif_local = await asyncio.to_thread(mp4_to_gif, local_path)
+                        tmp_dirs.append(str(Path(gif_local).parent))
+                        with open(gif_local, "rb") as f:
+                            await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                    else:
+                        with open(local_path, "rb") as f:
+                            await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
                 elif ext == ".gif" or mime == "image/gif":
                     with open(local_path, "rb") as f:
-                        await msg.reply_animation(animation=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                        await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
                 else:
                     with open(local_path, "rb") as f:
                         await msg.reply_document(document=f, read_timeout=120, write_timeout=120, connect_timeout=20)
@@ -62,12 +94,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await msg.reply_video(video=f, read_timeout=120, write_timeout=120, connect_timeout=20)
             elif photo_url:
                 tmp_path, ext, ct = await asyncio.to_thread(download_to_temp, photo_url)
-                if ext == ".gif":
-                    with open(tmp_path, "rb") as f:
-                        await msg.reply_animation(animation=f, read_timeout=120, write_timeout=120, connect_timeout=20)
-                else:
-                    with open(tmp_path, "rb") as f:
-                        await msg.reply_photo(photo=f, read_timeout=120, write_timeout=120, connect_timeout=20)
+                with open(tmp_path, "rb") as f:
+                    await msg.reply_photo(photo=f, read_timeout=120, write_timeout=120, connect_timeout=20)
             else:
                 await msg.reply_text("Could not extract media from that pin.")
         except Exception as e:
@@ -79,9 +107,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     os.remove(tmp_path)
                 except Exception:
                     pass
-            if tmp_dir and os.path.exists(tmp_dir):
+            for d in tmp_dirs:
                 try:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    shutil.rmtree(d, ignore_errors=True)
                 except Exception:
                     pass
 

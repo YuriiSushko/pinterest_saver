@@ -48,6 +48,39 @@ def download_to_temp(url: str, timeout: int = 60, max_bytes: int = 100 * 1024 * 
                 f.write(chunk)
     return path, ext, content_type
 
+def mp4_to_gif(mp4_path: str, max_seconds: int = 12, width: int = 480) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="pinsaver_gif_")
+    gif_path = str(Path(tmpdir) / "out.gif")
+    palette = str(Path(tmpdir) / "palette.png")
+
+    cmd_palette = [
+        "ffmpeg", "-y",
+        "-t", str(max_seconds),
+        "-i", mp4_path,
+        "-vf", f"fps=15,scale={width}:-1:flags=lanczos,palettegen",
+        palette
+    ]
+    cmd_gif = [
+        "ffmpeg", "-y",
+        "-t", str(max_seconds),
+        "-i", mp4_path,
+        "-i", palette,
+        "-lavfi", f"fps=15,scale={width}:-1:flags=lanczos[x];[x][1:v]paletteuse",
+        gif_path
+    ]
+
+    p1 = subprocess.run(cmd_palette, capture_output=True, text=True)
+    if p1.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError((p1.stderr or p1.stdout or "ffmpeg palettegen failed")[:2000])
+
+    p2 = subprocess.run(cmd_gif, capture_output=True, text=True)
+    if p2.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError((p2.stderr or p2.stdout or "ffmpeg gif failed")[:2000])
+
+    return gif_path
+
 def ytdlp_try_download(url: str, timeout: int = 120) -> str | None:
     tmpdir = tempfile.mkdtemp(prefix="pinsaver_")
     outtmpl = str(Path(tmpdir) / "media.%(ext)s")
